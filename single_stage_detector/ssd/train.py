@@ -97,7 +97,7 @@ def dboxes300_coco():
 
 def coco_eval(model, val_dataloader, cocoGt, encoder, inv_map, threshold,
               epoch, iteration, log_interval=100,
-              use_cuda=True, nms_valid_thresh=0.05):
+              use_cuda=False, nms_valid_thresh=0.05):
     from pycocotools.cocoeval import COCOeval
     print("")
     model.eval()
