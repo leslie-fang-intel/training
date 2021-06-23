@@ -385,15 +385,15 @@ def train300_mlperf_coco(args):
             args.train_iteration,
             [train_time],
             prefix='Train: ')
-
+    optim.zero_grad()
     # Model to NHWC
     ssd300 = ssd300.to(memory_format=torch.channels_last)
     # Model Prepack
-    if args.autocast and use_ipex:
-        ssd300, optim = ipex.optimize(ssd300, dtype=torch.bfloat16, optimizer=optim)
-    else:
-        ssd300, optim = ipex.optimize(ssd300, dtype=torch.float32, optimizer=optim)
-    optim.zero_grad()
+    if use_ipex:
+        if args.autocast:
+            ssd300, optim = ipex.optimize(ssd300, dtype=torch.bfloat16, optimizer=optim)
+        else:
+            ssd300, optim = ipex.optimize(ssd300, dtype=torch.float32, optimizer=optim)
     for epoch in range(args.epochs):
         mllogger.start(
             key=mllog_const.EPOCH_START,
