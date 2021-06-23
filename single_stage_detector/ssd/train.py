@@ -14,7 +14,11 @@ import logging
 from mlperf_logging.mllog import constants as mllog_const
 from mlperf_logger import ssd_print, broadcast_seeds
 from mlperf_logger import mllogger
-import intel_pytorch_extension as ipex
+
+use_ipex = False
+if os.environ.get('USE_IPEX') == "1":
+    import intel_pytorch_extension as ipex
+    use_ipex = True
 
 _BASE_LR=2.5e-3
 
@@ -384,7 +388,7 @@ def train300_mlperf_coco(args):
     # Model to NHWC
     ssd300 = ssd300.to(memory_format=torch.channels_last)
     # Model Prepack
-    if args.autocast:
+    if args.autocast and use_ipex:
         ssd300, optim = ipex.optimize(ssd300, dtype=torch.bfloat16, optimizer=optim)
     else:
         ssd300, optim = ipex.optimize(ssd300, dtype=torch.float32, optimizer=optim)
@@ -427,7 +431,11 @@ def train300_mlperf_coco(args):
                                     Variable(flabel, requires_grad=False)
                         # image to NHWC
                         fimg = fimg.contiguous(memory_format=torch.channels_last)
-                        with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
+                        if use_ipex:
+                            with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
+                                ploc, plabel = ssd300(fimg)
+                                loss = loss_func(ploc, plabel, gloc, glabel)
+                        else:
                             ploc, plabel = ssd300(fimg)
                             loss = loss_func(ploc, plabel, gloc, glabel)
                         loss = loss * (current_fragment_size / current_batch_size) # weighted mean
@@ -448,7 +456,11 @@ def train300_mlperf_coco(args):
                     fimg = Variable(fimg, requires_grad=True)
                     gloc, glabel = Variable(trans_bbox, requires_grad=False), \
                                 Variable(flabel, requires_grad=False)
-                    with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
+                    if use_ipex:
+                        with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
+                            ploc, plabel = ssd300(fimg)
+                            loss = loss_func(ploc, plabel, gloc, glabel)
+                    else:
                         ploc, plabel = ssd300(fimg)
                         loss = loss_func(ploc, plabel, gloc, glabel)
                     loss = loss * (current_fragment_size / current_batch_size) # weighted mean
