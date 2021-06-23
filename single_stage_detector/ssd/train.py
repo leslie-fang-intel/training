@@ -14,8 +14,47 @@ import logging
 from mlperf_logging.mllog import constants as mllog_const
 from mlperf_logger import ssd_print, broadcast_seeds
 from mlperf_logger import mllogger
+import intel_pytorch_extension as ipex
 
 _BASE_LR=2.5e-3
+
+class ProgressMeter(object):
+    def __init__(self, num_batches, meters, prefix=""):
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+        self.meters = meters
+        self.prefix = prefix
+
+    def display(self, batch):
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries += [str(meter) for meter in self.meters]
+        print('\t'.join(entries))
+
+    def _get_batch_fmtstr(self, num_batches):
+        num_digits = len(str(num_batches // 1))
+        fmt = '{:' + str(num_digits) + 'd}'
+        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, fmt=':f'):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
 
 def parse_args():
     parser = ArgumentParser(description="Train Single Shot MultiBox Detector"
@@ -73,7 +112,18 @@ def parse_args():
     parser.add_argument('--local_rank', default=os.getenv('LOCAL_RANK', 0), type=int,
                         help='Used for multi-process training. Can either be manually set '
                              'or automatically set by using \'python -m multiproc\'.')
-
+    # Added for performance measurement
+    parser.add_argument('--performance_only', action='store_true', default=False,
+                        help='only for performance test')
+    parser.add_argument('-w', '--warmup-iterations', default=0, type=int, metavar='N',
+                        help='number of warmup iterations to run')
+    parser.add_argument('-iter', '--train-iteration', type=int, default=None,
+                        help='set the iteration for the performance test of train, default is None')
+    parser.add_argument('-p', '--print-freq', default=10, type=int,
+                        metavar='N', help='print frequency (default: 10)')
+    # Added for BF16 training
+    parser.add_argument('--autocast', action='store_true', default=False,
+                        help='enable autocast')
     return parser.parse_args()
 
 
@@ -319,6 +369,11 @@ def train300_mlperf_coco(args):
         metadata={mllog_const.FIRST_EPOCH_NUM: 1,
                   mllog_const.EPOCH_COUNT: args.epochs})
 
+    train_time = AverageMeter('TrainTime', ':6.3f')
+    progress = ProgressMeter(
+        args.train_iteration,
+        [train_time],
+        prefix='Train: ')
     optim.zero_grad()
     for epoch in range(args.epochs):
         mllogger.start(
@@ -336,6 +391,8 @@ def train300_mlperf_coco(args):
                 param_group['lr'] = current_lr
 
         for nbatch, (img, img_id, img_size, bbox, label) in enumerate(train_dataloader):
+            if args.performance_only and nbatch >= args.warmup_iterations:
+                start_time=time.time()
             current_batch_size = img.shape[0]
             # Split batch for gradient accumulation
             img = torch.split(img, fragment_size)
@@ -350,22 +407,30 @@ def train300_mlperf_coco(args):
                     trans_bbox = trans_bbox.cuda()
                     flabel = flabel.cuda()
                 fimg = Variable(fimg, requires_grad=True)
-                ploc, plabel = ssd300(fimg)
                 gloc, glabel = Variable(trans_bbox, requires_grad=False), \
                                Variable(flabel, requires_grad=False)
-                loss = loss_func(ploc, plabel, gloc, glabel)
+                with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
+                    ploc, plabel = ssd300(fimg)
+                    loss = loss_func(ploc, plabel, gloc, glabel)
                 loss = loss * (current_fragment_size / current_batch_size) # weighted mean
                 loss.backward()
 
             warmup_step(iter_num, current_lr)
             optim.step()
             optim.zero_grad()
+            if args.performance_only and iter_num >= args.warmup_iterations:
+                train_time.update(time.time() - start_time)
+            if args.performance_only and iter_num % args.print_freq == 0:
+                progress.display(iter_num)
             if not np.isinf(loss.item()): avg_loss = 0.999*avg_loss + 0.001*loss.item()
             if args.rank == 0 and args.log_interval and not iter_num % args.log_interval:
                 print("Iteration: {:6d}, Loss function: {:5.3f}, Average Loss: {:.3f}"\
                     .format(iter_num, loss.item(), avg_loss))
             iter_num += 1
-
+            if args.performance_only and iter_num >= args.train_iteration:
+                break
+        if args.performance_only and iter_num >= args.train_iteration:
+            break
 
         if (args.val_epochs and (epoch+1) in args.val_epochs) or \
            (args.val_interval and not (epoch+1) % args.val_interval):
@@ -402,6 +467,13 @@ def train300_mlperf_coco(args):
         key=mllog_const.BLOCK_STOP,
         metadata={mllog_const.FIRST_EPOCH_NUM: 1,
                   mllog_const.EPOCH_COUNT: args.epochs})
+
+    if args.performance_only:
+        batch_size = args.batch_size
+        latency = train_time.avg / batch_size * 1000
+        perf = batch_size / train_time.avg
+        print('train latency %.2f ms'%latency)
+        print('train performance %.2f fps'%perf)
 
     return False
 
