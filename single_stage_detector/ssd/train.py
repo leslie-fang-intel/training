@@ -56,6 +56,10 @@ class AverageMeter(object):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
 
+def trace_handler(prof):
+    print(prof.key_averages().table(sort_by="self_cpu_time_total"))
+    torch.profiler.tensorboard_trace_handler('./ssdrn34_train_log')(prof)
+
 def parse_args():
     parser = ArgumentParser(description="Train Single Shot MultiBox Detector"
                                         " on COCO")
@@ -124,6 +128,8 @@ def parse_args():
     # Added for BF16 training
     parser.add_argument('--autocast', action='store_true', default=False,
                         help='enable autocast')
+    parser.add_argument('--profile', action='store_true', default=False,
+                        help='enable profile')
     return parser.parse_args()
 
 
@@ -389,7 +395,6 @@ def train300_mlperf_coco(args):
             print("lr decay step #{num}".format(num=args.lr_decay_schedule.index(epoch) + 1))
             for param_group in optim.param_groups:
                 param_group['lr'] = current_lr
-
         for nbatch, (img, img_id, img_size, bbox, label) in enumerate(train_dataloader):
             if args.performance_only and nbatch >= args.warmup_iterations:
                 start_time=time.time()
@@ -399,25 +404,49 @@ def train300_mlperf_coco(args):
             bbox = torch.split(bbox, fragment_size)
             label = torch.split(label, fragment_size)
 
-            for (fimg, fbbox, flabel) in zip(img, bbox, label):
-                current_fragment_size = fimg.shape[0]
-                trans_bbox = fbbox.transpose(1,2).contiguous()
-                if use_cuda:
-                    fimg = fimg.cuda()
-                    trans_bbox = trans_bbox.cuda()
-                    flabel = flabel.cuda()
-                fimg = Variable(fimg, requires_grad=True)
-                gloc, glabel = Variable(trans_bbox, requires_grad=False), \
-                               Variable(flabel, requires_grad=False)
-                with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
-                    ploc, plabel = ssd300(fimg)
-                    loss = loss_func(ploc, plabel, gloc, glabel)
-                loss = loss * (current_fragment_size / current_batch_size) # weighted mean
-                loss.backward()
+            if args.profile and args.performance_only and iter_num == 30:
+                # Profile Mode
+                with torch.profiler.profile(on_trace_ready=trace_handler) as prof:
+                    for (fimg, fbbox, flabel) in zip(img, bbox, label):
+                        current_fragment_size = fimg.shape[0]
+                        trans_bbox = fbbox.transpose(1,2).contiguous()
+                        if use_cuda:
+                            fimg = fimg.cuda()
+                            trans_bbox = trans_bbox.cuda()
+                            flabel = flabel.cuda()
+                        fimg = Variable(fimg, requires_grad=True)
+                        gloc, glabel = Variable(trans_bbox, requires_grad=False), \
+                                    Variable(flabel, requires_grad=False)
+                        with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
+                            ploc, plabel = ssd300(fimg)
+                            loss = loss_func(ploc, plabel, gloc, glabel)
+                        loss = loss * (current_fragment_size / current_batch_size) # weighted mean
+                        loss.backward()
 
-            warmup_step(iter_num, current_lr)
-            optim.step()
-            optim.zero_grad()
+                    warmup_step(iter_num, current_lr)
+                    optim.step()
+                    optim.zero_grad()
+            else:
+                # None Profile Mode
+                for (fimg, fbbox, flabel) in zip(img, bbox, label):
+                    current_fragment_size = fimg.shape[0]
+                    trans_bbox = fbbox.transpose(1,2).contiguous()
+                    if use_cuda:
+                        fimg = fimg.cuda()
+                        trans_bbox = trans_bbox.cuda()
+                        flabel = flabel.cuda()
+                    fimg = Variable(fimg, requires_grad=True)
+                    gloc, glabel = Variable(trans_bbox, requires_grad=False), \
+                                Variable(flabel, requires_grad=False)
+                    with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
+                        ploc, plabel = ssd300(fimg)
+                        loss = loss_func(ploc, plabel, gloc, glabel)
+                    loss = loss * (current_fragment_size / current_batch_size) # weighted mean
+                    loss.backward()
+
+                warmup_step(iter_num, current_lr)
+                optim.step()
+                optim.zero_grad()
             if args.performance_only and iter_num >= args.warmup_iterations:
                 train_time.update(time.time() - start_time)
             if args.performance_only and iter_num % args.print_freq == 0:
