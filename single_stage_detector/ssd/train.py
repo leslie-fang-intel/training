@@ -380,6 +380,14 @@ def train300_mlperf_coco(args):
         args.train_iteration,
         [train_time],
         prefix='Train: ')
+
+    # Model to NHWC
+    ssd300 = ssd300.to(memory_format=torch.channels_last)
+    # Model Prepack
+    if args.autocast:
+        ssd300, optim = ipex.optimize(ssd300, dtype=torch.bfloat16, optimizer=optim)
+    else:
+        ssd300, optim = ipex.optimize(ssd300, dtype=torch.float32, optimizer=optim)
     optim.zero_grad()
     for epoch in range(args.epochs):
         mllogger.start(
@@ -417,6 +425,8 @@ def train300_mlperf_coco(args):
                         fimg = Variable(fimg, requires_grad=True)
                         gloc, glabel = Variable(trans_bbox, requires_grad=False), \
                                     Variable(flabel, requires_grad=False)
+                        # image to NHWC
+                        fimg = fimg.contiguous(memory_format=torch.channels_last)
                         with ipex.amp.autocast(enabled=args.autocast, configure=ipex.conf.AmpConf(torch.bfloat16)):
                             ploc, plabel = ssd300(fimg)
                             loss = loss_func(ploc, plabel, gloc, glabel)
