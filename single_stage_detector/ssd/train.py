@@ -379,11 +379,12 @@ def train300_mlperf_coco(args):
         metadata={mllog_const.FIRST_EPOCH_NUM: 1,
                   mllog_const.EPOCH_COUNT: args.epochs})
 
-    train_time = AverageMeter('TrainTime', ':6.3f')
-    progress = ProgressMeter(
-        args.train_iteration,
-        [train_time],
-        prefix='Train: ')
+    if args.performance_only:
+        train_time = AverageMeter('TrainTime', ':6.3f')
+        progress = ProgressMeter(
+            args.train_iteration,
+            [train_time],
+            prefix='Train: ')
 
     # Model to NHWC
     ssd300 = ssd300.to(memory_format=torch.channels_last)
